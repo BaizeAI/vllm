@@ -1,0 +1,54 @@
+# .github/workflows/sync-upstream.yml
+name: Baize Sync Upstream
+
+on:
+  schedule:
+    # 每天凌晨 2 点执行（UTC 时间）
+    - cron: '0 2 * * *'
+  workflow_dispatch: # 允许手动触发
+  push:
+    tags:
+      - '*' # 当有新 tag 推送时触发
+
+permissions: write-all
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          # 替换为你的上游仓库 URL
+          git remote add upstream https://github.com/vllm-project/vllm.git
+          git fetch upstream
+
+      - name: Sync main branch
+        run: |
+          git checkout main
+          git merge upstream/main --allow-unrelated-histories
+          git push origin main
+
+      - name: Sync tags (excluding workflow changes)
+        run: |
+          # 获取上游所有 tags
+          git fetch upstream --tags
+          
+          # 推送标签，但排除包含工作流更改的标签
+          for tag in $(git tag -l); do
+            if git show $tag --name-only | grep -q "^\.github/workflows/"; then
+              echo "Skipping tag $tag (contains workflow changes)"
+            else
+              git push origin $tag || echo "Failed to push $tag"
+            fi
+          done

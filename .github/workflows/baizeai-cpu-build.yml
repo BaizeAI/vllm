@@ -1,0 +1,157 @@
+# .github/workflows/manual-docker-build.yml
+name: Manual Docker Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (leave empty to auto-select latest)'
+        required: false
+        type: string
+      force_build:
+        description: 'Force build even if image exists'
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # 每天凌晨 3 点执行（UTC 时间）
+    - cron: '0 3 * * *'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/vllm-openai-cpu
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+jobs:
+  select-tag:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      selected_tag: ${{ steps.determine_tag.outputs.tag }}
+      should_build: ${{ steps.check_image.outputs.should_build }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine tag to build
+        id: determine_tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            # 手动触发且指定了 tag
+            TAG="${{ inputs.tag }}"
+            echo "Using manually specified tag: $TAG"
+          else
+            # 自动选择最新 tag（按版本号排序）
+            git fetch --tags
+            TAG=$(git tag -l | grep -E '^v?[0-9]+\.[0-9]+(\.[0-9]+)?.*$' | sort -V | tail -1)
+            if [ -z "$TAG" ]; then
+              echo "No valid tags found"
+              exit 1
+            fi
+            echo "Auto-selected latest tag: $TAG"
+          fi
+          
+          # 验证 tag 是否存在
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG does not exist"
+            exit 1
+          fi
+          
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Check if image already exists
+        id: check_image
+        run: |
+          TAG="${{ steps.determine_tag.outputs.tag }}"
+          IMAGE_URL="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG"
+          
+          # 如果是强制构建，直接构建
+          if [ "${{ inputs.force_build }}" = "true" ]; then
+            echo "Force build enabled, will build regardless"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # 检查镜像是否已存在
+          if docker manifest inspect "$IMAGE_URL" >/dev/null 2>&1; then
+            echo "Image $IMAGE_URL already exists, skipping build"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "Image $IMAGE_URL does not exist, will build"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+  build-docker:
+    needs: select-tag
+    runs-on: ubuntu-latest
+    if: needs.select-tag.outputs.should_build == 'true'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout specific tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select-tag.outputs.selected_tag }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.select-tag.outputs.selected_tag }}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.cpu
+          platforms: linux/amd64 #,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Output build result
+        run: |
+          echo "Successfully built and pushed Docker image:"
+          echo "Tag: ${{ needs.select-tag.outputs.selected_tag }}"
+          echo "Images:"
+          echo "- ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.select-tag.outputs.selected_tag }}"
+          echo "- ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+
+  notify-skip:
+    needs: select-tag
+    runs-on: ubuntu-latest
+    if: needs.select-tag.outputs.should_build == 'false'
+    steps:
+      - name: Notify skip
+        run: |
+          echo "Build skipped for tag: ${{ needs.select-tag.outputs.selected_tag }}"
+          echo "Image already exists: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.select-tag.outputs.selected_tag }}"
+          echo "Use 'Force build' option to rebuild existing images."
