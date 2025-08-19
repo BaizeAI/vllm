@@ -69,10 +69,10 @@ class DefaultModelLoader(BaseModelLoader):
             # pylint: disable=C.
             from modelscope.hub.snapshot_download import snapshot_download
 
-            if not os.path.exists(model):
-                # Use file lock to prevent multiple processes from
-                # downloading the same model weights at the same time.
-                with get_lock(model, self.load_config.download_dir):
+            # Use file lock to prevent multiple processes from
+            # downloading the same model weights at the same time.
+            with get_lock(model, self.load_config.download_dir):
+                if not os.path.exists(model):
                     model_path = snapshot_download(
                         model_id=model,
                         cache_dir=self.load_config.download_dir,
@@ -81,8 +81,8 @@ class DefaultModelLoader(BaseModelLoader):
                         revision=revision,
                         ignore_file_pattern=self.load_config.ignore_patterns,
                     )
-            else:
-                model_path = model
+                else:
+                    model_path = model
             return model_path
         return None
 
@@ -207,16 +207,21 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         if current_platform.is_tpu():
-            # In PyTorch XLA, we should call `xm.mark_step` frequently so that
-            # not too many ops are accumulated in the XLA program.
-            import torch_xla.core.xla_model as xm
+            from vllm.platforms.tpu import USE_TPU_COMMONS
 
-            def _xla_weights_iterator(iterator: Generator):
-                for weights in iterator:
-                    yield weights
-                    xm.mark_step()
+            if not USE_TPU_COMMONS:
+                # In PyTorch XLA, we should call `xm.mark_step`
+                # requently so that not too many ops are accumulated
+                # in the XLA program. import torch_xla.core.xla_model
+                # as xm
+                import torch_xla.core.xla_model as xm
 
-            weights_iterator = _xla_weights_iterator(weights_iterator)
+                def _xla_weights_iterator(iterator: Generator):
+                    for weights in iterator:
+                        yield weights
+                        xm.mark_step()
+
+                weights_iterator = _xla_weights_iterator(weights_iterator)
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
