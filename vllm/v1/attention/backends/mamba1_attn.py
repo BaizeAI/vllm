@@ -1,83 +1,64 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
-from typing import ClassVar, Optional
+from dataclasses import dataclass, replace
+from typing import Any
 
-import torch
-
-from vllm.attention.backends.abstract import AttentionBackend
-from vllm.config import VllmConfig
-from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
-                                              CommonAttentionMetadata,
-                                              split_decodes_and_prefills)
-from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+from vllm.v1.attention.backend import AttentionBackend, CommonAttentionMetadata
+from vllm.v1.attention.backends.mamba_attn import (
+    BaseMambaAttentionMetadata,
+    BaseMambaAttentionMetadataBuilder,
+)
 
 
 class Mamba1AttentionBackend(AttentionBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "MAMBA1_ATTN"
 
     @staticmethod
     def get_builder_cls() -> type["Mamba1AttentionMetadataBuilder"]:
         return Mamba1AttentionMetadataBuilder
 
+    @classmethod
+    def is_ssm(cls) -> bool:
+        return True
+
 
 @dataclass
-class Mamba1AttentionMetadata:
-    query_start_loc: torch.Tensor
-    context_lens_tensor: torch.Tensor
-    state_indices_tensor: torch.Tensor
-    has_initial_states: Optional[torch.Tensor]
-    num_prefills: int
-    num_prefill_tokens: int
-    num_decodes: int
-    num_decode_tokens: int
+class Mamba1AttentionMetadata(BaseMambaAttentionMetadata):
+    pass
 
 
 class Mamba1AttentionMetadataBuilder(
-        AttentionMetadataBuilder[Mamba1AttentionMetadata]):
-    reorder_batch_threshold: ClassVar[int] = 1
-
-    def __init__(
-        self,
-        kv_cache_spec: AttentionSpec,
-        vllm_config: VllmConfig,
-        device: torch.device,
-        layer_names: list[str],
-    ):
-        assert isinstance(kv_cache_spec, MambaSpec)
-        self.kv_cache_spec = kv_cache_spec
-        self.device = device
-        self.vllm_config = vllm_config
-        self.layer_names = layer_names
+    BaseMambaAttentionMetadataBuilder[Mamba1AttentionMetadata]
+):
+    metadata_cls = Mamba1AttentionMetadata
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        **kwargs: Any,
     ) -> Mamba1AttentionMetadata:
-        query_start_loc = common_attn_metadata.query_start_loc
+        common = self._compute_common_metadata(common_attn_metadata)
 
-        state_indices_tensor = common_attn_metadata.block_table_tensor[:, 0]
-        context_lens_tensor = common_attn_metadata.num_computed_tokens_cpu.to(
-            query_start_loc.device)
+        if (
+            common.num_prefills > 0
+            and self.vllm_config.cache_config.mamba_cache_mode == "all"
+        ):
+            cu_chunk_seqlen_p, _, last_chunk_indices_p = (
+                self._build_chunk_metadata_tensors(
+                    self.kv_cache_spec.block_size,
+                    common,
+                    common_attn_metadata,
+                )
+            )
+            return replace(
+                common,
+                cu_chunk_seqlen_p=cu_chunk_seqlen_p,
+                last_chunk_indices_p=last_chunk_indices_p,
+            )
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(common_attn_metadata,
-                                       decode_threshold=1))
-
-        has_initial_states = None
-
-        if num_prefills > 0:
-            has_initial_states = context_lens_tensor > 0
-
-        return Mamba1AttentionMetadata(
-            query_start_loc=query_start_loc,
-            context_lens_tensor=context_lens_tensor,
-            has_initial_states=has_initial_states,
-            state_indices_tensor=state_indices_tensor,
-            num_prefills=num_prefills,
-            num_prefill_tokens=num_prefill_tokens,
-            num_decodes=num_decodes,
-            num_decode_tokens=num_decode_tokens,
-        )
+        return common

@@ -10,8 +10,26 @@ from PIL import Image, ImageDraw
 
 from vllm.multimodal.hasher import MultiModalHasher
 
+pytestmark = pytest.mark.cpu_test
+
 ASSETS_DIR = Path(__file__).parent / "assets"
 assert ASSETS_DIR.exists()
+
+
+def test_hash_single_item_different_shape():
+    x1 = torch.zeros(())
+    x2 = torch.zeros((1,))
+
+    hasher = MultiModalHasher
+    assert hasher.hash_kwargs(x=x1) != hasher.hash_kwargs(x=x2)
+
+
+def test_hash_key_order_invariant():
+    x = torch.zeros((5, 10))
+    y = torch.ones((5, 10))
+
+    hasher = MultiModalHasher
+    assert hasher.hash_kwargs(x=x, y=y) == hasher.hash_kwargs(y=y, x=x)
 
 
 # NOTE: Images that are the same visually are allowed to have the same hash
@@ -45,10 +63,11 @@ def test_hash_collision_image_transpose():
     assert hasher.hash_kwargs(image=image1) != hasher.hash_kwargs(image=image2)
 
 
-def test_hash_collision_tensor_shape():
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_hash_collision_tensor_shape(dtype):
     # The hash should be different though the data is the same when flattened
-    arr1 = torch.zeros((5, 10, 20, 3))
-    arr2 = torch.zeros((10, 20, 5, 3))
+    arr1 = torch.zeros((5, 10, 20, 3), dtype=dtype)
+    arr2 = torch.zeros((10, 20, 5, 3), dtype=dtype)
 
     hasher = MultiModalHasher
     assert hasher.hash_kwargs(data=arr1) != hasher.hash_kwargs(data=arr2)
@@ -87,8 +106,6 @@ def test_hash_image_exif_id():
 
     hasher = MultiModalHasher
     # first image has UUID in ImageID, so it should hash to that UUID
-    assert hasher.hash_kwargs(image=image1) == hasher.hash_kwargs(
-        image=id.bytes)
+    assert hasher.hash_kwargs(image=image1) == hasher.hash_kwargs(image=id.bytes)
     # second image has non-UUID in ImageID, so it should hash to the image data
-    assert hasher.hash_kwargs(image=image2) == hasher.hash_kwargs(
-        image=image2a)
+    assert hasher.hash_kwargs(image=image2) == hasher.hash_kwargs(image=image2a)

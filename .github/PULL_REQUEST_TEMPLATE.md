@@ -7,8 +7,6 @@ PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTT
 
 ## Test Result
 
-## (Optional) Documentation Update
-
 ---
 <details>
 <summary> Essential Elements of an Effective PR Description Checklist </summary>

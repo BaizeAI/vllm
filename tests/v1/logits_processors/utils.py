@@ -1,17 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import types
+import os
+import tempfile
 from enum import Enum, auto
-from typing import Optional
+from pathlib import Path
+from typing import Any
 
 import torch
 
+from tests.utils import requires_spawn_multiprocessing
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.logits_processor import (LOGITSPROCS_GROUP, BatchUpdate,
-                                             LogitsProcessor,
-                                             MoveDirectionality)
+from vllm.v1.sample.logits_processor import (
+    LOGITSPROCS_GROUP,
+    AdapterLogitsProcessor,
+    BatchUpdate,
+    LogitsProcessor,
+    RequestLogitsProcessor,
+)
+from vllm.v1.sample.logits_processor.builtin import process_dict_updates
+
+logger = init_logger(__name__)
 
 MODEL_NAME = "facebook/opt-125m"
 POOLING_MODEL_NAME = "BAAI/bge-base-en-v1.5"
@@ -19,12 +30,13 @@ DUMMY_LOGITPROC_ARG = "target_token"
 TEMP_GREEDY = 0.0
 MAX_TOKENS = 20
 DUMMY_LOGITPROC_ENTRYPOINT = "dummy_logitproc"
-DUMMY_LOGITPROC_MODULE = "DummyModule"
+DUMMY_LOGITPROC_MODULE = "tests.v1.logits_processors.utils"
 DUMMY_LOGITPROC_FQCN = f"{DUMMY_LOGITPROC_MODULE}:DummyLogitsProcessor"
 
 
 class CustomLogitprocSource(Enum):
     """How to source a logitproc for testing purposes"""
+
     LOGITPROC_SOURCE_NONE = auto()  # No custom logitproc
     LOGITPROC_SOURCE_ENTRYPOINT = auto()  # Via entrypoint
     LOGITPROC_SOURCE_FQCN = auto()  # Via fully-qualified class name (FQCN)
@@ -43,62 +55,54 @@ prompts = [
 class DummyLogitsProcessor(LogitsProcessor):
     """Fake logit processor to support unit testing and examples"""
 
-    def __init__(self, vllm_config: "VllmConfig", device: torch.device,
-                 is_pin_memory: bool):
-        self.req_info: dict[int, SamplingParams] = {}
+    @classmethod
+    def validate_params(cls, params: SamplingParams):
+        target_token: int | None = params.extra_args and params.extra_args.get(
+            "target_token"
+        )
+        if target_token is not None and not isinstance(target_token, int):
+            raise ValueError(
+                f"target_token value {target_token} {type(target_token)} is not int"
+            )
+
+    def __init__(
+        self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
+    ):
+        self.req_info: dict[int, int] = {}
 
     def is_argmax_invariant(self) -> bool:
         """Never impacts greedy sampling"""
         return False
 
-    def update_state(self, batch_update: Optional[BatchUpdate]):
-        if not batch_update:
-            return
+    def update_state(self, batch_update: BatchUpdate | None):
+        def extract_extra_arg(params: SamplingParams) -> int | None:
+            self.validate_params(params)
+            return params.extra_args and params.extra_args.get("target_token")
 
-        # Process added requests.
-        for index, params, _, _ in batch_update.added:
-            assert params is not None
-            if params.extra_args and (target_token :=
-                                      params.extra_args.get("target_token")):
-                self.req_info[index] = target_token
-
-        if self.req_info:
-            # Process removed requests.
-            for index in batch_update.removed:
-                self.req_info.pop(index, None)
-
-            # Process moved requests, unidirectional move (a->b) and swap
-            # (a<->b)
-            for adx, bdx, direct in batch_update.moved:
-                a_val = self.req_info.pop(adx, None)
-                b_val = self.req_info.pop(bdx, None)
-                if a_val is not None:
-                    self.req_info[bdx] = a_val
-                if direct == MoveDirectionality.SWAP and b_val is not None:
-                    self.req_info[adx] = b_val
+        process_dict_updates(
+            self.req_info,
+            batch_update,
+            lambda params, _, __: extract_extra_arg(params),
+        )
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self.req_info:
             return logits
 
         # Save target values before modification
-        rows_list = list(self.req_info.keys())
-        cols = torch.tensor([self.req_info[i] for i in rows_list],
-                            dtype=torch.long,
-                            device=logits.device)
-        rows = torch.tensor(rows_list, dtype=torch.long, device=logits.device)
+        cols = torch.tensor(
+            list(self.req_info.values()), dtype=torch.long, device=logits.device
+        )
+        rows = torch.tensor(
+            list(self.req_info.keys()), dtype=torch.long, device=logits.device
+        )
         values_to_keep = logits[rows, cols].clone()
 
         # Mask all but target tokens
-        logits[rows] = float('-inf')
+        logits[rows] = float("-inf")
         logits[rows, cols] = values_to_keep
 
         return logits
-
-
-"""Dummy module with dummy logitproc class"""
-dummy_module = types.ModuleType(DUMMY_LOGITPROC_MODULE)
-dummy_module.DummyLogitsProcessor = DummyLogitsProcessor  # type: ignore
 
 
 class EntryPoint:
@@ -123,5 +127,117 @@ class EntryPoints(list):
         self.names = [ep.name for ep in eps]
 
 
-"""Fake version of importlib.metadata.entry_points"""
-entry_points = lambda group: EntryPoints(group)
+class DummyPerReqLogitsProcessor:
+    """The request-level logits processor masks out all logits except the
+    token id identified by `target_token`"""
+
+    def __init__(self, target_token: int) -> None:
+        """Specify `target_token`"""
+        self.target_token = target_token
+
+    def __call__(
+        self,
+        output_ids: list[int],
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        val_to_keep = logits[self.target_token].item()
+        logits[:] = float("-inf")
+        logits[self.target_token] = val_to_keep
+        return logits
+
+
+class WrappedPerReqLogitsProcessor(AdapterLogitsProcessor):
+    """Example of wrapping a fake request-level logit processor to create a
+    batch-level logits processor"""
+
+    def is_argmax_invariant(self) -> bool:
+        return False
+
+    def new_req_logits_processor(
+        self,
+        params: SamplingParams,
+    ) -> RequestLogitsProcessor | None:
+        """This method returns a new request-level logits processor, customized
+        to the `target_token` value associated with a particular request.
+
+        Returns None if the logits processor should not be applied to the
+        particular request. To use the logits processor the request must have
+        a "target_token" custom argument with an integer value.
+
+        Args:
+          params: per-request sampling params
+
+        Returns:
+          `Callable` request logits processor, or None
+        """
+        target_token: Any | None = params.extra_args and params.extra_args.get(
+            "target_token"
+        )
+        if target_token is None:
+            return None
+        if not isinstance(target_token, int):
+            logger.warning(
+                "target_token value %s is not int; not applying logits"
+                " processor to request.",
+                target_token,
+            )
+            return None
+        return DummyPerReqLogitsProcessor(target_token)
+
+
+def register_fake_entrypoint(monkeypatch) -> str:
+    """Register the dummy logitsproc entrypoint in a way that is visible
+    to spawned subprocesses by creating a real dist-info directory on disk.
+
+    Unlike monkey-patching importlib.metadata.entry_points (which only works
+    with fork), this approach writes a real dist-info package that
+    importlib.metadata can discover in any subprocess via PYTHONPATH.
+
+    Returns the temp directory path.
+    """
+    tmpdir = Path(tempfile.mkdtemp(prefix="dummy-logitproc-"))
+    dist_info = tmpdir / "dummy_logitproc-0.1.dist-info"
+    dist_info.mkdir()
+
+    # Write METADATA file (required by importlib.metadata)
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: dummy-logitproc\nVersion: 0.1\n",
+        encoding="utf-8",
+    )
+
+    # Write entry_points.txt
+    (dist_info / "entry_points.txt").write_text(
+        f"[{LOGITSPROCS_GROUP}]\n"
+        f"{DUMMY_LOGITPROC_ENTRYPOINT} = {DUMMY_LOGITPROC_FQCN}\n",
+        encoding="utf-8",
+    )
+
+    # Add to PYTHONPATH so spawned subprocesses can discover it
+    existing = os.environ.get("PYTHONPATH", "")
+    monkeypatch.setenv(
+        "PYTHONPATH", str(tmpdir) + (os.pathsep + existing if existing else "")
+    )
+
+    # Also update sys.path for the current process so the driver can
+    # discover the entrypoint.
+    monkeypatch.syspath_prepend(str(tmpdir))
+
+    return str(tmpdir)
+
+
+def fake_entry_points(group: str) -> EntryPoints:
+    """Fake version of importlib.metadata.entry_points."""
+    return EntryPoints(group)
+
+
+def setup_fake_entrypoint(monkeypatch) -> None:
+    """Expose the dummy logitproc entrypoint for the current platform."""
+    if requires_spawn_multiprocessing():
+        register_fake_entrypoint(monkeypatch)
+        monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        return
+
+    import importlib.metadata
+
+    monkeypatch.setattr(importlib.metadata, "entry_points", fake_entry_points)
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")

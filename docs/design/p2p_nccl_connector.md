@@ -88,7 +88,7 @@ pip install "vllm>=0.9.2"
 #### Proxy (e.g. 10.0.1.1)
 
 ```shell
-cd {your vllm directory}/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/
+cd {your vllm directory}/examples/disaggregated/p2p_nccl_xpyd/
 python3 disagg_proxy_p2p_nccl_xpyd.py &
 ```
 
@@ -97,7 +97,7 @@ python3 disagg_proxy_p2p_nccl_xpyd.py &
 ??? console "Command"
 
     ```shell
-    VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES=0 vllm serve {your model directory} \
+    CUDA_VISIBLE_DEVICES=0 vllm serve {your model directory} \
         --host 0.0.0.0 \
         --port 20001 \
         --tensor-parallel-size 1 \
@@ -118,7 +118,7 @@ python3 disagg_proxy_p2p_nccl_xpyd.py &
 ??? console "Command"
 
     ```shell
-    VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES=1 vllm serve {your model directory} \
+    CUDA_VISIBLE_DEVICES=1 vllm serve {your model directory} \
         --host 0.0.0.0 \
         --port 20002 \
         --tensor-parallel-size 1 \
@@ -139,7 +139,7 @@ python3 disagg_proxy_p2p_nccl_xpyd.py &
 ??? console "Command"
 
     ```shell
-    VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES=2 vllm serve {your model directory} \
+    CUDA_VISIBLE_DEVICES=2 vllm serve {your model directory} \
         --host 0.0.0.0 \
         --port 20003 \
         --tensor-parallel-size 1 \
@@ -160,7 +160,7 @@ python3 disagg_proxy_p2p_nccl_xpyd.py &
 ??? console "Command"
 
     ```shell
-    VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES=3 vllm serve {your model directory} \
+    CUDA_VISIBLE_DEVICES=3 vllm serve {your model directory} \
         --host 0.0.0.0 \
         --port 20004 \
         --tensor-parallel-size 1 \
@@ -181,7 +181,7 @@ python3 disagg_proxy_p2p_nccl_xpyd.py &
 #### Proxy (e.g. 10.0.1.1)
 
 ```shell
-cd {your vllm directory}/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/
+cd {your vllm directory}/examples/disaggregated/p2p_nccl_xpyd/
 python3 disagg_proxy_p2p_nccl_xpyd.py &
 ```
 
@@ -190,7 +190,7 @@ python3 disagg_proxy_p2p_nccl_xpyd.py &
 ??? console "Command"
 
     ```shell
-    VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES=0 vllm serve {your model directory} \
+    CUDA_VISIBLE_DEVICES=0 vllm serve {your model directory} \
         --host 0.0.0.0 \
         --port 20001 \
         --tensor-parallel-size 1 \
@@ -211,7 +211,7 @@ python3 disagg_proxy_p2p_nccl_xpyd.py &
 ??? console "Command"
 
     ```shell
-    VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES=1 vllm serve {your model directory} \
+    CUDA_VISIBLE_DEVICES=1 vllm serve {your model directory} \
         --host 0.0.0.0 \
         --port 20002 \
         --tensor-parallel-size 1 \
@@ -232,7 +232,7 @@ python3 disagg_proxy_p2p_nccl_xpyd.py &
 ??? console "Command"
 
     ```shell
-    VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES=2 vllm serve {your model directory} \
+    CUDA_VISIBLE_DEVICES=2 vllm serve {your model directory} \
         --host 0.0.0.0 \
         --port 20003 \
         --tensor-parallel-size 1 \
@@ -253,7 +253,7 @@ python3 disagg_proxy_p2p_nccl_xpyd.py &
 ??? console "Command"
 
     ```shell
-    VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES=3 vllm serve {your model directory} \
+    CUDA_VISIBLE_DEVICES=3 vllm serve {your model directory} \
         --host 0.0.0.0 \
         --port 20004 \
         --tensor-parallel-size 1 \

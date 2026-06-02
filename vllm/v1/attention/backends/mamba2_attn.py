@@ -1,205 +1,173 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import math
-from dataclasses import dataclass
-from typing import ClassVar, Optional
+import itertools
+from dataclasses import dataclass, replace
+from typing import Any
 
 import torch
 
-from vllm.attention.backends.abstract import AttentionBackend
-from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.config import VllmConfig
-from vllm.v1.attention.backends.utils import (AttentionCGSupport,
-                                              AttentionMetadataBuilder,
-                                              CommonAttentionMetadata,
-                                              split_decodes_and_prefills)
-from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    CommonAttentionMetadata,
+)
+from vllm.v1.attention.backends.mamba_attn import (
+    BaseMambaAttentionMetadata,
+    BaseMambaAttentionMetadataBuilder,
+)
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 
-def _query_start_loc_to_chunk_indices_offsets(query_start_loc: torch.Tensor,
-                                              chunk_size: int,
-                                              total_seqlens: int):
+def compute_varlen_chunk_metadata(
+    query_start_loc: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build chunk-aligned, variable-length metadata used by Mamba2 SSD kernels.
 
-    cu_seqlens = query_start_loc[1:]  # remove prepended 0
+    Given per-sequence cumulative token starts `query_start_loc` of shape [B+1]
+    and a physical `chunk_size`, returns three tensors on the same device:
+      - cu_chunk_seqlens:  (nchunks+1,) int32   exclusive prefix-sum of
+        logical-chunk lengths (each logical chunk never crosses a sequence or
+        physical-chunk boundary).
+      - last_chunk_indices: (B,)       int32   index of the last logical chunk
+        for each sequence (=-1 for empty sequences).
+      - seq_idx_chunks:     (nchunks,) int32   sequence index for each logical
+        chunk in order.
 
-    # outputs will have length expansion of chunks that do not divide
-    # chunk_size
-    N = math.ceil(total_seqlens / chunk_size) + (cu_seqlens[:-1] % chunk_size
-                                                 > 0).sum()
-    chunk_indices = torch.arange(N,
-                                 dtype=torch.int,
-                                 device=query_start_loc.device)
-    chunk_offsets = torch.zeros((N, ),
-                                dtype=torch.int,
-                                device=query_start_loc.device)
+    This is intentionally lightweight and CPU-side; it mirrors the metadata
+    produced by the V1 Mamba2 meta-data builder and is exported so tests
+    (and other callers) can avoid duplicating the logic.
+    """
+    assert query_start_loc.ndim == 1, "query_start_loc must be 1-D [B+1]"
+    assert int(query_start_loc[0].item()) == 0, "query_start_loc[0] must be 0"
+    device = query_start_loc.device
 
-    p = 0  # num of insertions
-    for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+    qsl64 = query_start_loc.to(torch.int64)
+    starts = qsl64[:-1].tolist()
+    ends = qsl64[1:].tolist()
+    total = int(qsl64[-1].item())
 
-        # if does not divide chunk_size, then there is one chunk insertion
-        p += (s % chunk_size > 0)
+    chunk_lens: list[int] = []
+    seq_idx_chunks: list[int] = []
+    last_chunk_indices: list[int] = [-1] * len(starts)
 
-        # get the dimensions
-        # - the + 1 for _e is to shift the boundary by one chunk
-        # - this shifting is not needed if chunk_size divides e
-        _s, _e = s // chunk_size + p, e // chunk_size + p + (e % chunk_size
-                                                             > 0)
+    for b, (s, e) in enumerate(zip(starts, ends)):
+        if e <= s:
+            # empty sequence
+            continue
+        pos = s
+        while pos < e:
+            # split at both sequence boundaries and physical chunk boundaries
+            room = chunk_size - (pos % chunk_size)
+            take = min(room, e - pos)
+            chunk_lens.append(int(take))
+            seq_idx_chunks.append(b)
+            last_chunk_indices[b] = len(chunk_lens) - 1
+            pos += take
 
-        # adjust indices and offsets
-        chunk_indices[_s:_e] -= p
-        chunk_offsets[_s] = s % chunk_size
+    # Exclusive prefix sum over logical-chunk lengths
+    if chunk_lens:
+        cu_chunk_seqlens = torch.tensor(
+            [0] + list(itertools.accumulate(chunk_lens)),
+            device=device,
+            dtype=torch.int32,
+        )
+        # Final boundary must equal total tokens
+        assert int(cu_chunk_seqlens[-1].item()) == total
+    else:
+        cu_chunk_seqlens = torch.tensor([0], device=device, dtype=torch.int32)
 
-    return chunk_indices, chunk_offsets
+    last_chunk_indices_t = (
+        torch.tensor(last_chunk_indices, device=device, dtype=torch.int32)
+        if len(starts) > 0
+        else torch.empty((0,), device=device, dtype=torch.int32)
+    )
+    seq_idx_chunks_t = torch.tensor(seq_idx_chunks, device=device, dtype=torch.int32)
+    return cu_chunk_seqlens, last_chunk_indices_t, seq_idx_chunks_t
 
 
 class Mamba2AttentionBackend(AttentionBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "MAMBA2_ATTN"
 
     @staticmethod
     def get_builder_cls() -> type["Mamba2AttentionMetadataBuilder"]:
         return Mamba2AttentionMetadataBuilder
 
+    @classmethod
+    def is_ssm(cls) -> bool:
+        return True
+
 
 @dataclass
-class Mamba2AttentionMetadata:
-    num_prefills: int
-    num_prefill_tokens: int
-    num_decodes: int
-    num_decode_tokens: int
-    query_start_loc: torch.Tensor
-    seq_lens: torch.Tensor
+class Mamba2AttentionMetadata(BaseMambaAttentionMetadata):
+    prep_initial_states: bool = False
+    chunk_size: int = 0
 
-    prep_initial_states: bool
-    chunk_size: int
-
-    # The following tensors only contain prefill requests and will be None if
-    # the batch has no prefill request.
-    has_initial_states_p: Optional[torch.Tensor]
-    seq_idx_p: Optional[torch.Tensor]
-    chunk_indices_p: Optional[torch.Tensor]
-    chunk_offsets_p: Optional[torch.Tensor]
-
-    state_indices_tensor: torch.Tensor  # shape: [batch,]
-
-    # The following attributes are for triton implementation of causal_conv1d
-    nums_dict: Optional[dict] = None
-    cu_seqlen: Optional[int] = None
-    batch_ptr: Optional[torch.tensor] = None
-    token_chunk_offset_ptr: Optional[torch.tensor] = None
+    # Chunk-related metadata (only for prefill)
+    seq_idx_p: torch.Tensor | None = None
 
 
 class Mamba2AttentionMetadataBuilder(
-        AttentionMetadataBuilder[Mamba2AttentionMetadata]):
-    cudagraph_support: ClassVar[AttentionCGSupport] = \
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    BaseMambaAttentionMetadataBuilder[Mamba2AttentionMetadata]
+):
+    metadata_cls = Mamba2AttentionMetadata
 
-    reorder_batch_threshold: ClassVar[int] = 1
-
-    def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str],
-                 vllm_config: VllmConfig, device: torch.device):
-        assert isinstance(kv_cache_spec, MambaSpec)
-        self.kv_cache_spec = kv_cache_spec
-        self.chunk_size = vllm_config.model_config.get_mamba_chunk_size()
-        self.vllm_config = vllm_config
-        self.compilation_config = vllm_config.compilation_config
-        assert self.chunk_size is not None, (
-            "chunk_size needs to be set in the model config for Mamba2 models")
-        self.decode_cudagraph_max_bs = min(
-            self.vllm_config.scheduler_config.max_num_seqs,
-            self.compilation_config.max_capture_size)
-        self.state_indices_tensor = torch.empty(
-            (self.decode_cudagraph_max_bs, ),
-            dtype=torch.int32,
-            device=device,
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        chunk_size = vllm_config.model_config.get_mamba_chunk_size()
+        assert chunk_size is not None, (
+            "chunk_size needs to be set in the model config for Mamba2 models"
         )
+        self.chunk_size: int = chunk_size
 
-    def build(self,
-              common_prefix_len: int,
-              common_attn_metadata: CommonAttentionMetadata,
-              fast_build: bool = False) -> Mamba2AttentionMetadata:
-        num_reqs = common_attn_metadata.num_reqs
-        query_start_loc = common_attn_metadata.query_start_loc
-        seq_lens = common_attn_metadata.seq_lens
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        **kwargs: Any,
+    ) -> Mamba2AttentionMetadata:
+        common = self._compute_common_metadata(
+            common_attn_metadata,
+            num_accepted_tokens=kwargs.get("num_accepted_tokens"),
+            prev_last_scheduled_idx=kwargs.get("prev_last_scheduled_idx"),
+        )
 
         seq_idx_p = None
-        chunk_indices_p, chunk_offsets_p = None, None
-        # Need flags to indicate if there are initial states
-        # currently we really only support the FlashAttention backend
-        has_initial_states_p = None
+        cu_chunk_seqlen_p = None
+        last_chunk_indices_p = None
         prep_initial_states = False
 
-        state_indices_tensor = common_attn_metadata.block_table_tensor[:, 0]
+        # Compute seq_idx for prefill only
+        if common.num_prefills > 0:
+            prep_initial_states = (
+                torch.any(common.has_initial_states_p).item()
+                if common.has_initial_states_p is not None
+                else False
+            )
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(common_attn_metadata,
-                                       decode_threshold=1))
+            cu_chunk_seqlen_p, seq_idx_p, last_chunk_indices_p = (
+                self._build_chunk_metadata_tensors(
+                    self.chunk_size,
+                    common,
+                    common_attn_metadata,
+                )
+            )
 
-        # Compute seq_idx, chunk_indices and chunk_offsets for prefill only
-        if num_prefills > 0:
-            #[batch,]
-            has_initial_states_cpu = (
-                common_attn_metadata.
-                num_computed_tokens_cpu[num_reqs - num_prefills:num_reqs] > 0)
-            prep_initial_states = torch.any(has_initial_states_cpu).item()
-            has_initial_states_p = has_initial_states_cpu.to(
-                query_start_loc.device)
-
-            query_start_loc_p = common_attn_metadata.query_start_loc[
-                -num_prefills - 1:] - num_decode_tokens
-
-            seq_idx_p = torch.repeat_interleave(torch.arange(
-                num_prefills,
-                dtype=torch.int32,
-                device=query_start_loc_p.device),
-                                                query_start_loc_p.diff(),
-                                                output_size=num_prefill_tokens)
-            seq_idx_p.unsqueeze_(0)
-
-            # We compute metadata for chunked prefill once at the top level
-            # model forward and reuse them in mamba layers. If not needed,
-            # they will be ignored inside mamba kernels.
-            if prep_initial_states:
-                chunk_indices_p, chunk_offsets_p = (
-                    _query_start_loc_to_chunk_indices_offsets(
-                        query_start_loc_p, self.chunk_size,
-                        num_prefill_tokens))
-
-        elif num_decodes <= self.decode_cudagraph_max_bs:
-            # Pad state tensor for CUDA graph
-            num_input_tokens = self.vllm_config.pad_for_cudagraph(num_decodes)
-            self.state_indices_tensor[:num_decodes].copy_(state_indices_tensor,
-                                                          non_blocking=True)
-            state_indices_tensor = self.state_indices_tensor[:num_input_tokens]
-            state_indices_tensor[num_decodes:] = PAD_SLOT_ID
-
-        attn_metadata = Mamba2AttentionMetadata(
-            num_prefills=num_prefills,
-            num_prefill_tokens=num_prefill_tokens,
-            num_decodes=num_decodes,
-            num_decode_tokens=num_decode_tokens,
-            query_start_loc=query_start_loc,
-            seq_lens=seq_lens,
+        return replace(
+            common,
             prep_initial_states=prep_initial_states,
             chunk_size=self.chunk_size,
-            has_initial_states_p=has_initial_states_p,
             seq_idx_p=seq_idx_p,
-            chunk_indices_p=chunk_indices_p,
-            chunk_offsets_p=chunk_offsets_p,
-            state_indices_tensor=state_indices_tensor,
+            cu_chunk_seqlen_p=cu_chunk_seqlen_p,
+            last_chunk_indices_p=last_chunk_indices_p,
         )
-        return attn_metadata
-
-    def build_for_cudagraph_capture(
-            self, common_attn_metadata: CommonAttentionMetadata):
-        """
-        This method builds the metadata for full cudagraph capture.
-        Currently, only decode is supported for full cudagraphs with Mamba.
-        """
-        m = common_attn_metadata
-
-        assert m.num_reqs == m.num_actual_tokens, \
-            "Mamba only supports decode-only full CUDAGraph capture. " \
-            "Make sure all cudagraph capture sizes <= max_num_seq."
-
-        m.max_query_len = 1  # decode-only
-
-        return self.build(0, m)
